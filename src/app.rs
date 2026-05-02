@@ -119,6 +119,7 @@ pub struct PredictionResult {
 #[derive(Debug)]
 pub enum ChatResult {
     Started { prompt: String },
+    Delta(String),
     Tool { call: String, output: String },
     Finished(Result<String>),
 }
@@ -300,6 +301,9 @@ impl App {
                         self.follow_ai_tail();
                         self.status = "AI response streaming".to_string();
                     }
+                    ChatResult::Delta(delta) => {
+                        self.conversation.append_assistant_delta(&delta);
+                    }
                     ChatResult::Tool { call, output } => {
                         self.push_chat_tool_result(call, output);
                     }
@@ -432,9 +436,17 @@ impl App {
                         prompt, transcript
                     )
                 };
-                let response = client.ask_stream(&prompt_text, &workspace, |_| {});
+                let mut stream_buffer = AgentStreamBuffer::default();
+                let response = client.ask_stream(&prompt_text, &workspace, |delta| {
+                    if let Some(text) = stream_buffer.push(delta) {
+                        let _ = tx.send(ChatResult::Delta(text));
+                    }
+                });
                 match response {
                     Ok(text) => {
+                        if let Some(text) = stream_buffer.finish() {
+                            let _ = tx.send(ChatResult::Delta(text));
+                        }
                         let tool_calls = extract_agent_tool_calls(&text);
                         if tool_calls.is_empty() {
                             final_response = Ok(clean_agent_response(&text));
@@ -1281,6 +1293,9 @@ impl App {
     fn handle_command_mode(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
             KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Tab => {
+                self.autocomplete_command_buffer();
+            }
             KeyCode::Enter => {
                 let command = self.command_buffer.trim().to_string();
                 self.mode = Mode::Normal;
@@ -1349,6 +1364,9 @@ impl App {
     fn handle_chat_mode(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
             KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Tab => {
+                self.autocomplete_chat_input();
+            }
             KeyCode::PageUp => self.scroll_ai_up(AI_SCROLL_STEP * 4),
             KeyCode::PageDown => self.scroll_ai_down(AI_SCROLL_STEP * 4),
             KeyCode::Home => {
@@ -1505,6 +1523,23 @@ impl App {
         self.push_terminal(output.lines().next().unwrap_or("").to_string());
     }
 
+    fn autocomplete_command_buffer(&mut self) {
+        if let Some(completed) = complete_command_input(&self.command_buffer, command_candidates())
+        {
+            self.command_buffer = completed;
+        }
+    }
+
+    fn autocomplete_chat_input(&mut self) {
+        if !self.chat_input.trim_start().starts_with('/') {
+            return;
+        }
+        if let Some(completed) = complete_command_input(&self.chat_input, chat_command_candidates())
+        {
+            self.chat_input = completed;
+        }
+    }
+
     fn scroll_ai_up(&mut self, lines: usize) {
         self.ai_follow_tail = false;
         self.ai_scroll = self.ai_scroll.saturating_add(lines);
@@ -1605,7 +1640,7 @@ impl App {
         let mut parts = command[1..].split_whitespace();
         match parts.next().unwrap_or("") {
             "help" => {
-                self.status = "chat commands: /help /clear /login /model NAME /open PATH /save /close /focus editor /focus explorer /focus ai /pwd /ls [PATH] /tree [PATH] /cat PATH /undo /redo /tab next /tab prev /split /close other /reopen closed /build /test /run /rerun".to_string();
+                self.status = "chat commands: /help /clear /login /model NAME /open PATH /save /close /focus editor /focus explorer /focus ai /pwd /ls [PATH] /tree [PATH] /cat PATH /undo /redo /tab next /tab prev /split /close other /reopen closed /build /test /run /rerun /new [PATH] /reload /next /prev /editor /explorer /ai /quit".to_string();
             }
             "clear" => {
                 self.conversation = ConversationState::default();
@@ -1629,12 +1664,23 @@ impl App {
                     self.execute_command(&format!("open {}", target))?;
                 }
             }
+            "new" => {
+                let target = parts.collect::<Vec<_>>().join(" ");
+                if target.is_empty() {
+                    self.new_buffer(None);
+                } else {
+                    self.new_buffer(Some(self.resolve_tool_path(&target)));
+                }
+            }
             "model" => {
                 let model = parts.collect::<Vec<_>>().join(" ");
                 self.set_codex_model(&model)?;
             }
             "save" => {
                 self.save()?;
+            }
+            "reload" => {
+                self.reload_current()?;
             }
             "close" => {
                 self.close_active_tab();
@@ -1666,6 +1712,8 @@ impl App {
                 "prev" => self.prev_tab(),
                 _ => {}
             },
+            "next" => self.next_tab(),
+            "prev" => self.prev_tab(),
             "search" => {
                 self.mode = Mode::Search;
                 if self.search_buffer.is_empty() {
@@ -1732,6 +1780,10 @@ impl App {
                 "ai" => self.ai_visible = true,
                 _ => {}
             },
+            "editor" => self.focus = FocusPane::Editor,
+            "explorer" => self.focus = FocusPane::Explorer,
+            "ai" => self.ai_visible = true,
+            "quit" => std::process::exit(0),
             _ => {
                 self.status = format!("unknown chat command: {}", command);
             }
@@ -1745,6 +1797,7 @@ impl App {
             "w" | "save" => self.save()?,
             "open" => self.open_entry()?,
             "new" => self.new_buffer(None),
+            "reload" => self.reload_current()?,
             "close" => self.close_active_tab(),
             "duplicate line" => self.duplicate_current_line(),
             "split" => self.toggle_split(),
@@ -1766,6 +1819,9 @@ impl App {
                 self.mode = Mode::Chat;
                 self.chat_input.clear();
             }
+            "focus editor" => self.focus = FocusPane::Editor,
+            "focus explorer" => self.focus = FocusPane::Explorer,
+            "focus ai" => self.ai_visible = true,
             "build" => self.spawn_task(TaskKind::Build),
             "test" => self.spawn_task(TaskKind::Test),
             "run" => self.spawn_task(TaskKind::Run),
@@ -1827,15 +1883,9 @@ impl App {
                 };
                 self.new_buffer(Some(path));
             }
-            "reload" => {
-                self.reload_current()?;
-            }
             "help" => {
                 self.show_help = true;
                 self.mode = Mode::Help;
-            }
-            "focus ai" => {
-                self.ai_visible = true;
             }
             _ => {
                 if !command.is_empty() {
@@ -2718,6 +2768,8 @@ impl App {
             Line::from("  /model NAME            set model from chat"),
             Line::from("  /login                 open Codex login"),
             Line::from("  /clear                 clear chat history"),
+            Line::from("  /new [PATH]            create a buffer"),
+            Line::from("  /reload                reload current file"),
             Line::from("  /close                 close buffer"),
             Line::from("  /pwd                   show current folder"),
             Line::from("  /ls [PATH]             list folder contents"),
@@ -2725,11 +2777,14 @@ impl App {
             Line::from("  /cat PATH              print a file"),
             Line::from("  /undo /redo            undo or redo"),
             Line::from("  /tab next / tab prev   cycle buffers"),
+            Line::from("  /next /prev            cycle buffers"),
             Line::from("  /split                 toggle split view"),
             Line::from("  /close other           keep only active buffer"),
             Line::from("  /reopen closed         reopen a closed buffer"),
-            Line::from("  build / test / run     run project tasks"),
-            Line::from("  rerun                  rerun last task"),
+            Line::from("  /editor /explorer /ai  focus panes"),
+            Line::from("  /build /test /run      run project tasks"),
+            Line::from("  /rerun                 rerun last task"),
+            Line::from("  /quit                  exit the app"),
             Line::from(""),
             Line::from("Press Esc or F1 to close."),
         ];
@@ -2825,6 +2880,43 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
+#[derive(Default)]
+struct AgentStreamBuffer {
+    pending: String,
+}
+
+impl AgentStreamBuffer {
+    fn push(&mut self, delta: &str) -> Option<String> {
+        self.pending.push_str(delta);
+        let mut visible = String::new();
+        while let Some(newline_index) = self.pending.find('\n') {
+            let line = self.pending[..newline_index].to_string();
+            self.pending.drain(..=newline_index);
+            if parse_agent_tool_call(&line).is_none() {
+                visible.push_str(&line);
+                visible.push('\n');
+            }
+        }
+        if visible.is_empty() {
+            None
+        } else {
+            Some(visible)
+        }
+    }
+
+    fn finish(&mut self) -> Option<String> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let line = std::mem::take(&mut self.pending);
+        if parse_agent_tool_call(&line).is_none() {
+            Some(line)
+        } else {
+            None
+        }
+    }
+}
+
 fn inner_rect(area: Rect) -> Rect {
     if area.width <= 2 || area.height <= 2 {
         return area;
@@ -2850,6 +2942,50 @@ fn ai_history_scroll(max_scroll: usize, ai_scroll: usize, follow_tail: bool) -> 
 
 fn extract_agent_tool_calls(text: &str) -> Vec<String> {
     text.lines().filter_map(parse_agent_tool_call).collect()
+}
+
+fn complete_command_input(input: &str, candidates: &[&str]) -> Option<String> {
+    let prefix = input.trim_start();
+    if prefix.is_empty() {
+        return None;
+    }
+
+    let matches = candidates
+        .iter()
+        .copied()
+        .filter(|candidate| candidate.starts_with(prefix))
+        .collect::<Vec<_>>();
+    if matches.is_empty() {
+        return None;
+    }
+
+    let indent_len = input.len().saturating_sub(prefix.len());
+    let indent = &input[..indent_len];
+    if matches.len() == 1 {
+        return Some(format!("{}{}", indent, matches[0]));
+    }
+
+    let mut common = matches[0].to_string();
+    for candidate in &matches[1..] {
+        common = common_prefix(&common, candidate);
+        if common == prefix {
+            break;
+        }
+    }
+
+    if common.len() > prefix.len() {
+        Some(format!("{}{}", indent, common))
+    } else {
+        Some(format!("{}{}", indent, matches[0]))
+    }
+}
+
+fn common_prefix(a: &str, b: &str) -> String {
+    a.chars()
+        .zip(b.chars())
+        .take_while(|(left, right)| left == right)
+        .map(|(ch, _)| ch)
+        .collect()
 }
 
 fn clean_agent_response(text: &str) -> String {
@@ -2913,6 +3049,74 @@ fn parse_agent_tool_call(line: &str) -> Option<String> {
         }
         _ => None,
     }
+}
+
+fn command_candidates() -> &'static [&'static str] {
+    &[
+        "help",
+        "save",
+        "open",
+        "new",
+        "reload",
+        "close",
+        "duplicate line",
+        "split",
+        "close other",
+        "reopen closed",
+        "tab next",
+        "tab prev",
+        "search",
+        "goto",
+        "ai ask",
+        "focus editor",
+        "focus explorer",
+        "focus ai",
+        "build",
+        "test",
+        "run",
+        "rerun",
+        "quit",
+    ]
+}
+
+fn chat_command_candidates() -> &'static [&'static str] {
+    &[
+        "/help",
+        "/clear",
+        "/login",
+        "/model ",
+        "/open ",
+        "/new ",
+        "/save",
+        "/reload",
+        "/close",
+        "/focus editor",
+        "/focus explorer",
+        "/focus ai",
+        "/editor",
+        "/explorer",
+        "/ai",
+        "/quit",
+        "/pwd",
+        "/ls ",
+        "/tree ",
+        "/cat ",
+        "/undo",
+        "/redo",
+        "/tab next",
+        "/tab prev",
+        "/next",
+        "/prev",
+        "/split",
+        "/close other",
+        "/reopen closed",
+        "/build",
+        "/test",
+        "/run",
+        "/rerun",
+        "/search",
+        "/goto",
+    ]
 }
 
 fn run_agent_tool_call(root: &Path, show_hidden: bool, call: &str) -> Result<String> {
@@ -3101,7 +3305,9 @@ fn read_git_status(root: &Path) -> Result<HashMap<PathBuf, GitStatus>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ai_history_scroll, clean_agent_response, extract_agent_tool_calls};
+    use super::{
+        ai_history_scroll, clean_agent_response, complete_command_input, extract_agent_tool_calls,
+    };
 
     #[test]
     fn ai_history_scroll_follows_tail_when_enabled() {
@@ -3141,5 +3347,28 @@ TOOL /cat
             clean_agent_response("TOOL /pwdHey."),
             "I could not parse the AI response. Try again."
         );
+    }
+
+    #[test]
+    fn command_completion_fills_unique_prefixes() {
+        assert_eq!(
+            complete_command_input("re", super::command_candidates()),
+            Some("reload".to_string())
+        );
+        assert_eq!(
+            complete_command_input("/f", super::chat_command_candidates()),
+            Some("/focus ".to_string())
+        );
+    }
+
+    #[test]
+    fn agent_stream_buffer_hides_tool_lines() {
+        let mut buffer = super::AgentStreamBuffer::default();
+        assert_eq!(
+            buffer.push("hello\nTOOL /pwd\nwor"),
+            Some("hello\n".to_string())
+        );
+        assert_eq!(buffer.push("ld"), None);
+        assert_eq!(buffer.finish(), Some("world".to_string()));
     }
 }
