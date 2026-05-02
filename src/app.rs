@@ -335,6 +335,7 @@ impl App {
                     TaskResult::Finished { label, output } => match output {
                         Ok(text) => {
                             self.status = format!("{} complete", label);
+                            self.push_chat_tool_result(label.clone(), text.clone());
                             self.push_terminal(self.status.clone());
                             for line in text.lines().take(40) {
                                 self.push_terminal(line.to_string());
@@ -342,6 +343,7 @@ impl App {
                         }
                         Err(err) => {
                             self.status = format!("{} failed: {}", label, err);
+                            self.push_chat_note(label.clone(), self.status.clone());
                             self.push_terminal(self.status.clone());
                         }
                     },
@@ -1526,6 +1528,15 @@ impl App {
         self.push_terminal(output.lines().next().unwrap_or("").to_string());
     }
 
+    fn push_chat_note(&mut self, label: impl Into<String>, body: impl Into<String>) {
+        let label = label.into();
+        let body = body.into();
+        self.conversation
+            .push_tool_output(label.clone(), body.clone());
+        self.status = label;
+        self.push_terminal(body.lines().next().unwrap_or("").to_string());
+    }
+
     fn autocomplete_command_buffer(&mut self) {
         if let Some(completed) = complete_command_input(&self.command_buffer, command_candidates())
         {
@@ -1541,6 +1552,19 @@ impl App {
         {
             self.chat_input = completed;
         }
+    }
+
+    fn chat_suggestions(&self) -> Vec<&'static str> {
+        let prefix = self.chat_input.trim_start();
+        if !prefix.starts_with('/') {
+            return Vec::new();
+        }
+        chat_command_candidates()
+            .iter()
+            .copied()
+            .filter(|candidate| candidate.starts_with(prefix))
+            .take(4)
+            .collect()
     }
 
     fn scroll_ai_up(&mut self, lines: usize) {
@@ -1643,21 +1667,26 @@ impl App {
         let mut parts = command[1..].split_whitespace();
         match parts.next().unwrap_or("") {
             "help" => {
-                self.status = "chat commands: /help /clear /login /model NAME /open PATH /save /close /focus editor /focus explorer /focus ai /pwd /ls [PATH] /tree [PATH] /cat PATH /undo /redo /tab next /tab prev /split /close other /reopen closed /build /test /run /rerun /new [PATH] /reload /next /prev /editor /explorer /ai /quit".to_string();
+                self.push_chat_note(
+                    "/help",
+                    "chat commands: /help /clear /login /model NAME /open PATH /save /close /focus editor /focus explorer /focus ai /pwd /ls [PATH] /tree [PATH] /cat PATH /undo /redo /tab next /tab prev /split /close other /reopen closed /build /test /run /rerun /new [PATH] /reload /next /prev /editor /explorer /ai /quit",
+                );
             }
             "clear" => {
                 self.conversation = ConversationState::default();
                 self.follow_ai_tail();
-                self.status = "chat cleared".to_string();
+                self.push_chat_note("/clear", "chat cleared");
             }
             "login" => {
-                self.status = "opening Codex login...".to_string();
+                self.push_chat_note("/login", "opening Codex login...");
                 if let Err(err) = ai::login_and_save() {
                     self.status = format!("Codex login failed: {}", err);
+                    self.push_chat_note("/login", self.status.clone());
                     self.push_terminal(self.status.clone());
                 } else {
                     self.status = "Codex login complete".to_string();
                     self.reload_ai_client();
+                    self.push_chat_note("/login", self.status.clone());
                     self.push_terminal(self.status.clone());
                 }
             }
@@ -1665,34 +1694,42 @@ impl App {
                 let target = parts.collect::<Vec<_>>().join(" ");
                 if !target.is_empty() {
                     self.execute_command(&format!("open {}", target))?;
+                    self.push_chat_note("/open", format!("opened {}", target));
                 }
             }
             "new" => {
                 let target = parts.collect::<Vec<_>>().join(" ");
                 if target.is_empty() {
                     self.new_buffer(None);
+                    self.push_chat_note("/new", "new buffer");
                 } else {
                     self.new_buffer(Some(self.resolve_tool_path(&target)));
+                    self.push_chat_note("/new", format!("new buffer {}", target));
                 }
             }
             "model" => {
                 let model = parts.collect::<Vec<_>>().join(" ");
                 self.set_codex_model(&model)?;
+                self.push_chat_note("/model", format!("codex model set to {}", model));
             }
             "save" => {
                 self.save()?;
+                self.push_chat_note("/save", "saved current buffer");
             }
             "reload" => {
                 self.reload_current()?;
+                self.push_chat_note("/reload", "reloaded current file");
             }
             "close" => {
                 self.close_active_tab();
+                self.push_chat_note("/close", "closed buffer");
             }
             "undo" => {
                 if self.editor.undo() {
                     self.sync_active_tab();
                     self.bump_edit();
                     self.status = "undo".to_string();
+                    self.push_chat_note("/undo", "undo");
                 }
             }
             "redo" => {
@@ -1700,32 +1737,56 @@ impl App {
                     self.sync_active_tab();
                     self.bump_edit();
                     self.status = "redo".to_string();
+                    self.push_chat_note("/redo", "redo");
                 }
             }
             "split" => {
                 self.toggle_split();
+                self.push_chat_note(
+                    "/split",
+                    if self.split_enabled {
+                        "split view enabled"
+                    } else {
+                        "split view disabled"
+                    },
+                );
             }
             "reopen" => {
                 if parts.next() == Some("closed") {
                     self.reopen_closed_tab();
+                    self.push_chat_note("/reopen closed", "reopened closed buffer");
                 }
             }
             "tab" => match parts.next().unwrap_or("") {
-                "next" => self.next_tab(),
-                "prev" => self.prev_tab(),
+                "next" => {
+                    self.next_tab();
+                    self.push_chat_note("/tab next", "next buffer");
+                }
+                "prev" => {
+                    self.prev_tab();
+                    self.push_chat_note("/tab prev", "previous buffer");
+                }
                 _ => {}
             },
-            "next" => self.next_tab(),
-            "prev" => self.prev_tab(),
+            "next" => {
+                self.next_tab();
+                self.push_chat_note("/next", "next buffer");
+            }
+            "prev" => {
+                self.prev_tab();
+                self.push_chat_note("/prev", "previous buffer");
+            }
             "search" => {
                 self.mode = Mode::Search;
                 if self.search_buffer.is_empty() {
                     self.search_buffer = self.editor.current_line().to_string();
                 }
+                self.push_chat_note("/search", "search mode");
             }
             "goto" => {
                 self.mode = Mode::GoToLine;
                 self.goto_line_buffer.clear();
+                self.push_chat_note("/goto", "go to line");
             }
             "pwd" => {
                 let output = format!("{}\n", self.explorer_dir.display());
@@ -1776,19 +1837,42 @@ impl App {
                 } else {
                     self.status = "no previous task".to_string();
                 }
+                self.push_chat_note("/rerun", self.status.clone());
             }
             "focus" => match parts.next().unwrap_or("") {
-                "editor" => self.focus = FocusPane::Editor,
-                "explorer" => self.focus = FocusPane::Explorer,
-                "ai" => self.ai_visible = true,
+                "editor" => {
+                    self.focus = FocusPane::Editor;
+                    self.push_chat_note("/focus editor", "focused editor");
+                }
+                "explorer" => {
+                    self.focus = FocusPane::Explorer;
+                    self.push_chat_note("/focus explorer", "focused explorer");
+                }
+                "ai" => {
+                    self.ai_visible = true;
+                    self.push_chat_note("/focus ai", "opened ai");
+                }
                 _ => {}
             },
-            "editor" => self.focus = FocusPane::Editor,
-            "explorer" => self.focus = FocusPane::Explorer,
-            "ai" => self.ai_visible = true,
-            "quit" => std::process::exit(0),
+            "editor" => {
+                self.focus = FocusPane::Editor;
+                self.push_chat_note("/editor", "focused editor");
+            }
+            "explorer" => {
+                self.focus = FocusPane::Explorer;
+                self.push_chat_note("/explorer", "focused explorer");
+            }
+            "ai" => {
+                self.ai_visible = true;
+                self.push_chat_note("/ai", "opened ai");
+            }
+            "quit" => {
+                self.push_chat_note("/quit", "exit requested");
+                std::process::exit(0)
+            }
             _ => {
                 self.status = format!("unknown chat command: {}", command);
+                self.push_chat_note(command, self.status.clone());
             }
         }
         Ok(())
@@ -2631,6 +2715,17 @@ impl App {
             };
             let input_lines = Text::from(vec![
                 Line::from(input_text),
+                {
+                    let suggestions = self.chat_suggestions();
+                    if suggestions.is_empty() {
+                        Line::from("")
+                    } else {
+                        Line::from(Span::styled(
+                            format!("Tab: {}", suggestions.join("  ")),
+                            Style::default().fg(Color::DarkGray),
+                        ))
+                    }
+                },
                 Line::from(Span::styled(
                     "Enter to send  Esc to close  PageUp/PageDown to scroll history  End to follow",
                     Style::default().fg(Color::DarkGray),
