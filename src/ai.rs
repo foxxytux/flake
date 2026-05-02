@@ -325,12 +325,6 @@ impl ConversationState {
         });
     }
 
-    pub fn append_assistant_delta(&mut self, delta: &str) {
-        if let Some(active) = self.active.as_mut() {
-            active.response.push_str(delta);
-        }
-    }
-
     pub fn finish_turn_with_response(&mut self, response: String) {
         if let Some(active) = self.active.take() {
             self.turns.push(ConversationTurn {

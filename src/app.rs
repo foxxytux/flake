@@ -118,7 +118,6 @@ pub struct PredictionResult {
 #[derive(Debug)]
 pub enum ChatResult {
     Started { prompt: String },
-    Delta(String),
     Tool { call: String, output: String },
     Finished(Result<String>),
 }
@@ -300,9 +299,6 @@ impl App {
                         self.follow_ai_tail();
                         self.status = "AI response streaming".to_string();
                     }
-                    ChatResult::Delta(delta) => {
-                        self.conversation.append_assistant_delta(&delta);
-                    }
                     ChatResult::Tool { call, output } => {
                         self.push_chat_tool_result(call, output);
                     }
@@ -434,14 +430,12 @@ impl App {
                         prompt, transcript
                     )
                 };
-                let response = client.ask_stream(&prompt_text, &workspace, |delta| {
-                    let _ = tx.send(ChatResult::Delta(delta.to_string()));
-                });
+                let response = client.ask_stream(&prompt_text, &workspace, |_| {});
                 match response {
                     Ok(text) => {
                         let tool_calls = extract_agent_tool_calls(&text);
                         if tool_calls.is_empty() {
-                            final_response = Ok(text);
+                            final_response = Ok(clean_agent_response(&text));
                             break;
                         }
 
@@ -2853,20 +2847,71 @@ fn ai_history_scroll(max_scroll: usize, ai_scroll: usize, follow_tail: bool) -> 
 }
 
 fn extract_agent_tool_calls(text: &str) -> Vec<String> {
-    text.lines()
-        .filter_map(|line| {
+    text.lines().filter_map(parse_agent_tool_call).collect()
+}
+
+fn clean_agent_response(text: &str) -> String {
+    let cleaned = text
+        .lines()
+        .filter(|line| {
             let trimmed = line.trim();
-            let call = trimmed
-                .strip_prefix("TOOL ")
-                .or_else(|| trimmed.strip_prefix("tool "))?;
-            let call = call.trim();
-            if call.is_empty() {
+            !trimmed.starts_with("TOOL ") && !trimmed.starts_with("tool ")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string();
+    if cleaned.is_empty() {
+        "AI returned an invalid tool request. Supported tools are /pwd, /ls, /tree, and /cat."
+            .to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn parse_agent_tool_call(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let call = trimmed
+        .strip_prefix("TOOL ")
+        .or_else(|| trimmed.strip_prefix("tool "))?
+        .trim();
+    let mut parts = call.split_whitespace();
+    let command = parts.next()?;
+    match command {
+        "/pwd" | "pwd" => {
+            if parts.next().is_some() {
                 None
             } else {
-                Some(call.to_string())
+                Some("/pwd".to_string())
             }
-        })
-        .collect()
+        }
+        "/ls" | "ls" | "/tree" | "tree" => {
+            let target = parts.collect::<Vec<_>>().join(" ");
+            if target.split_whitespace().any(|part| {
+                part.eq_ignore_ascii_case("TOOL") || part.to_ascii_lowercase().contains("tool")
+            }) {
+                return None;
+            }
+            if target.is_empty() {
+                Some(format!("/{}", command.trim_start_matches('/')))
+            } else {
+                Some(format!("/{} {}", command.trim_start_matches('/'), target))
+            }
+        }
+        "/cat" | "cat" => {
+            let target = parts.collect::<Vec<_>>().join(" ");
+            if target.is_empty()
+                || target.split_whitespace().any(|part| {
+                    part.eq_ignore_ascii_case("TOOL") || part.to_ascii_lowercase().contains("tool")
+                })
+            {
+                None
+            } else {
+                Some(format!("/cat {}", target))
+            }
+        }
+        _ => None,
+    }
 }
 
 fn run_agent_tool_call(root: &Path, show_hidden: bool, call: &str) -> Result<String> {
@@ -3055,7 +3100,7 @@ fn read_git_status(root: &Path) -> Result<HashMap<PathBuf, GitStatus>> {
 
 #[cfg(test)]
 mod tests {
-    use super::ai_history_scroll;
+    use super::{ai_history_scroll, clean_agent_response, extract_agent_tool_calls};
 
     #[test]
     fn ai_history_scroll_follows_tail_when_enabled() {
@@ -3067,5 +3112,33 @@ mod tests {
         assert_eq!(ai_history_scroll(12, 0, false), 12);
         assert_eq!(ai_history_scroll(12, 4, false), 8);
         assert_eq!(ai_history_scroll(12, 99, false), 0);
+    }
+
+    #[test]
+    fn extracts_only_valid_agent_tool_calls() {
+        let text = "\
+TOOL /pwd
+TOOL /pwdHey.
+TOOL /ls ..
+TOOL /ls ..TOOL /cat ../README.md
+tool cat src/app.rs
+TOOL /cat
+";
+        assert_eq!(
+            extract_agent_tool_calls(text),
+            vec!["/pwd", "/ls ..", "/cat src/app.rs"]
+        );
+    }
+
+    #[test]
+    fn clean_agent_response_hides_tool_protocol_lines() {
+        assert_eq!(
+            clean_agent_response("TOOL /pwd\nHere is the answer."),
+            "Here is the answer."
+        );
+        assert_eq!(
+            clean_agent_response("TOOL /pwdHey."),
+            "AI returned an invalid tool request. Supported tools are /pwd, /ls, /tree, and /cat."
+        );
     }
 }
