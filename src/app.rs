@@ -302,13 +302,16 @@ impl App {
                         self.status = "AI response streaming".to_string();
                     }
                     ChatResult::Delta(delta) => {
+                        self.follow_ai_tail();
                         self.conversation.append_assistant_delta(&delta);
                     }
                     ChatResult::Tool { call, output } => {
+                        self.follow_ai_tail();
                         self.push_chat_tool_result(call, output);
                     }
                     ChatResult::Finished(response) => match response {
                         Ok(text) => {
+                            self.follow_ai_tail();
                             self.conversation.finish_turn_with_response(text);
                             self.status = "AI response received".to_string();
                             self.push_terminal("ai response received");
@@ -2550,51 +2553,42 @@ impl App {
         history_area: Option<Rect>,
         input_area: Option<Rect>,
     ) {
-        let mut history_lines: Vec<Line<'static>> = Vec::new();
+        let mut history_lines: Vec<String> = Vec::new();
         if let Some(suggestion) = &self.editor.suggestion {
-            history_lines.push(Line::from(vec![Span::styled(
-                "Suggestion",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            )]));
-            history_lines.push(Line::from(suggestion.clone()));
-            history_lines.push(Line::from(""));
+            history_lines.push("Suggestion".to_string());
+            history_lines.push(suggestion.clone());
+            history_lines.push(String::new());
         }
         let conversation_lines = self.conversation.lines();
         if !conversation_lines.is_empty() {
-            history_lines.push(Line::from(vec![Span::styled(
-                if self.conversation.is_active() {
-                    "Agent live"
-                } else {
-                    "Agent"
-                },
-                Style::default()
-                    .fg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD),
-            )]));
+            history_lines.push(if self.conversation.is_active() {
+                "Agent live".to_string()
+            } else {
+                "Agent".to_string()
+            });
             for line in conversation_lines {
-                history_lines.push(Line::from(line));
+                history_lines.push(line);
             }
         }
         if history_lines.is_empty() {
             if self.ai_client.is_none() {
-                history_lines.push(Line::from(
+                history_lines.push(
                     self.ai_bootstrap_error
                         .as_deref()
                         .map(|err| format!("Codex unavailable: {}", err))
                         .unwrap_or_else(|| "Codex unavailable. Run `codex login`.".to_string()),
-                ));
+                );
             } else {
-                history_lines.push(Line::from("No AI activity yet."));
-                history_lines.push(Line::from("Ask for help below, or type /help."));
+                history_lines.push("No AI activity yet.".to_string());
+                history_lines.push("Ask for help below, or type /help.".to_string());
             }
         }
 
         let history_rect = history_area.unwrap_or(area);
         let history_inner = inner_rect(history_rect);
         let visible_lines = history_inner.height as usize;
-        let max_scroll = history_lines.len().saturating_sub(visible_lines);
+        let wrapped_lines = wrap_transcript_lines(&history_lines, history_inner.width as usize);
+        let max_scroll = wrapped_lines.len().saturating_sub(visible_lines);
         let scroll = ai_history_scroll(max_scroll, self.ai_scroll, self.ai_follow_tail);
         let title = {
             let mut text = String::from("AI");
@@ -2610,10 +2604,14 @@ impl App {
             }
             text
         };
-        let history_text = Text::from(history_lines);
+        let history_text = Text::from(
+            wrapped_lines
+                .into_iter()
+                .map(Line::from)
+                .collect::<Vec<_>>(),
+        );
         let history_widget = Paragraph::new(history_text)
             .block(Block::default().title(title).borders(Borders::ALL))
-            .wrap(Wrap { trim: false })
             .scroll((scroll as u16, 0));
         frame.render_widget(history_widget, history_rect);
 
@@ -2949,6 +2947,57 @@ fn ai_history_scroll(max_scroll: usize, ai_scroll: usize, follow_tail: bool) -> 
         return max_scroll;
     }
     max_scroll.saturating_sub(ai_scroll.min(max_scroll))
+}
+
+fn wrap_transcript_lines(lines: &[String], width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut wrapped = Vec::new();
+    for line in lines {
+        if line.is_empty() {
+            wrapped.push(String::new());
+            continue;
+        }
+
+        let mut current = String::new();
+        for word in line.split_whitespace() {
+            let word_len = word.chars().count();
+            if word_len > width {
+                if !current.is_empty() {
+                    wrapped.push(current);
+                    current = String::new();
+                }
+                let mut chunk = String::new();
+                for ch in word.chars() {
+                    chunk.push(ch);
+                    if chunk.chars().count() >= width {
+                        wrapped.push(chunk);
+                        chunk = String::new();
+                    }
+                }
+                if !chunk.is_empty() {
+                    current.push_str(&chunk);
+                }
+                continue;
+            }
+
+            let separator = if current.is_empty() { 0 } else { 1 };
+            let prospective = current.chars().count() + separator + word_len;
+            if prospective > width {
+                wrapped.push(current);
+                current = word.to_string();
+            } else {
+                if !current.is_empty() {
+                    current.push(' ');
+                }
+                current.push_str(word);
+            }
+        }
+
+        if !current.is_empty() {
+            wrapped.push(current);
+        }
+    }
+    wrapped
 }
 
 fn extract_agent_tool_calls(text: &str) -> Vec<String> {
@@ -3318,6 +3367,7 @@ fn read_git_status(root: &Path) -> Result<HashMap<PathBuf, GitStatus>> {
 mod tests {
     use super::{
         ai_history_scroll, clean_agent_response, complete_command_input, extract_agent_tool_calls,
+        wrap_transcript_lines,
     };
 
     #[test]
@@ -3381,5 +3431,14 @@ TOOL /cat
         );
         assert_eq!(buffer.push("ld"), Some("ld".to_string()));
         assert_eq!(buffer.finish(), None);
+    }
+
+    #[test]
+    fn wraps_transcript_rows_before_scrolling() {
+        let rows = wrap_transcript_lines(
+            &["Agent".to_string(), "this is a very long line".to_string()],
+            10,
+        );
+        assert_eq!(rows, vec!["Agent", "this is a", "very long", "line"]);
     }
 }
