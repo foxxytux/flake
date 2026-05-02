@@ -2889,7 +2889,18 @@ impl AgentStreamBuffer {
     fn push(&mut self, delta: &str) -> Option<String> {
         self.pending.push_str(delta);
         let mut visible = String::new();
-        while let Some(newline_index) = self.pending.find('\n') {
+        loop {
+            let Some(newline_index) = self.pending.find('\n') else {
+                if self.pending.is_empty() {
+                    break;
+                }
+                if self.pending.starts_with("TOOL ") || self.pending.starts_with("tool ") {
+                    break;
+                }
+                visible.push_str(&self.pending);
+                self.pending.clear();
+                break;
+            };
             let line = self.pending[..newline_index].to_string();
             self.pending.drain(..=newline_index);
             if parse_agent_tool_call(&line).is_none() {
@@ -3366,9 +3377,9 @@ TOOL /cat
         let mut buffer = super::AgentStreamBuffer::default();
         assert_eq!(
             buffer.push("hello\nTOOL /pwd\nwor"),
-            Some("hello\n".to_string())
+            Some("hello\nwor".to_string())
         );
-        assert_eq!(buffer.push("ld"), None);
-        assert_eq!(buffer.finish(), Some("world".to_string()));
+        assert_eq!(buffer.push("ld"), Some("ld".to_string()));
+        assert_eq!(buffer.finish(), None);
     }
 }
