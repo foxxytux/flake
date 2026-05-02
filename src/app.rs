@@ -4,7 +4,8 @@ use crate::editor::TextBuffer;
 use crate::fs::{self, Entry};
 use anyhow::{Context, Result};
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use ratatui::{
     Frame,
@@ -350,11 +351,12 @@ impl App {
 
             if event::poll(TICK_RATE)? {
                 match event::read()? {
-                    Event::Key(key) => {
+                    Event::Key(key) if key.kind != KeyEventKind::Release => {
                         if self.handle_key(key)? {
                             break;
                         }
                     }
+                    Event::Key(_) => {}
                     Event::Mouse(mouse) => {
                         self.handle_mouse(mouse)?;
                     }
@@ -2862,8 +2864,7 @@ fn clean_agent_response(text: &str) -> String {
         .trim()
         .to_string();
     if cleaned.is_empty() {
-        "AI returned an invalid tool request. Supported tools are /pwd, /ls, /tree, and /cat."
-            .to_string()
+        "I could not parse the AI response. Try again.".to_string()
     } else {
         cleaned
     }
@@ -3138,7 +3139,7 @@ TOOL /cat
         );
         assert_eq!(
             clean_agent_response("TOOL /pwdHey."),
-            "AI returned an invalid tool request. Supported tools are /pwd, /ls, /tree, and /cat."
+            "I could not parse the AI response. Try again."
         );
     }
 }

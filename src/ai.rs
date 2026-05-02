@@ -146,11 +146,11 @@ impl CodexClient {
         F: FnMut(&str),
     {
         let input = format!(
-            "Workspace context:\n{}\n\nRequest:\n{}\n\nTool protocol:\nYou must use tools proactively whenever the request depends on repository state, file contents, paths, symbols, or any fact that can be verified from the workspace. Do not guess if a tool can confirm the answer. Before responding to any code or workspace question, inspect the repo with tools first. Keep using tools until you have enough evidence.\n\nAllowed tool requests are lines that start with `TOOL ` followed by one of `/pwd`, `/ls PATH`, `/tree PATH`, or `/cat PATH`. Emit only the tool line; do not wrap it in markdown. After tool results are provided, continue with the answer and use tools again if more detail is still needed.",
+            "Workspace context:\n{}\n\nRequest:\n{}\n\nTool protocol:\nUse tools when the request depends on repository state, file contents, paths, symbols, or any fact that can be verified from the workspace. For casual conversation, greetings, or questions that do not need workspace context, answer normally without tools. Do not guess if a tool can confirm the answer.\n\nAllowed tool requests are lines that start with `TOOL ` followed by exactly one of `/pwd`, `/ls PATH`, `/tree PATH`, or `/cat PATH`. A tool request line must contain only that single command and optional path. Do not combine a tool request with prose or another tool request on the same line. After tool results are provided, continue with the answer and use tools again only if more workspace detail is still needed.",
             workspace, prompt
         );
         self.post_responses_stream(
-            "You are Flake, a terminal-first AI coding agent. Be concise, concrete, and useful. Treat tool use as the default whenever workspace facts matter. If there is any uncertainty about the repository, inspect it with tools before answering. Never pretend you inspected files or paths you did not verify.",
+            "You are Flake, a terminal-first AI coding agent. Be concise, concrete, and useful. Use tools for workspace facts, but answer normal conversation normally. Never pretend you inspected files or paths you did not verify.",
             &input,
             &mut on_delta,
         )
