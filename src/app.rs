@@ -1380,6 +1380,9 @@ impl App {
             }
             KeyCode::End => self.follow_ai_tail(),
             KeyCode::Enter => {
+                if self.chat_input.trim_start().starts_with('/') {
+                    self.autocomplete_chat_input();
+                }
                 let prompt = self.chat_input.trim().to_string();
                 if !prompt.is_empty() {
                     if prompt.starts_with('/') {
@@ -3514,6 +3517,10 @@ TOOL /cat
         assert_eq!(
             complete_command_input("/f", super::chat_command_candidates()),
             Some("/focus ".to_string())
+        );
+        assert_eq!(
+            complete_command_input("/he", super::chat_command_candidates()),
+            Some("/help".to_string())
         );
     }
 
